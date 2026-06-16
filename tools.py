@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -20,6 +21,20 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+
+# Words that carry no relevance signal — stripped before scoring so they don't
+# inflate matches. Includes filler, query phrasing, and size/price words that
+# are handled by the agent's regex parser rather than keyword overlap.
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "in", "of", "to", "on", "with",
+    "i", "im", "i'm", "am", "is", "it", "my", "me", "you", "your",
+    "looking", "look", "want", "wanting", "need", "needing", "find", "finding",
+    "some", "something", "anything", "that", "this", "what", "whats", "what's",
+    "out", "there", "would", "how", "style", "wear", "wearing", "get", "got",
+    "under", "below", "less", "than", "max", "around", "about", "cheap",
+    "size", "sized", "fit", "fits",
+}
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -69,8 +84,65 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Pull meaningful keywords out of the free-text description.
+    keywords = _keywords(description)
+
+    scored: list[tuple[int, dict]] = []
+    for listing in listings:
+        # Price filter (inclusive). Skip if over the ceiling.
+        if max_price is not None and listing["price"] > max_price:
+            continue
+
+        # Size filter (case-insensitive substring, so "M" matches "S/M").
+        if size is not None and not _size_matches(size, listing["size"]):
+            continue
+
+        score = _score_listing(keywords, listing)
+        if score > 0:
+            scored.append((score, listing))
+
+    # Highest score first; ties keep dataset order (stable sort on -score).
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [listing for _, listing in scored]
+
+
+def _keywords(text: str) -> list[str]:
+    """Lowercase, split on non-letters, and drop stopwords/short tokens."""
+    tokens = re.findall(r"[a-z]+", text.lower())
+    return [t for t in tokens if t not in _STOPWORDS and len(t) > 1]
+
+
+def _size_matches(query_size: str, listing_size: str) -> bool:
+    """Case-insensitive substring match (e.g. 'm' in 's/m', '8' in 'us 8')."""
+    return query_size.strip().lower() in listing_size.lower()
+
+
+def _score_listing(keywords: list[str], listing: dict) -> int:
+    """
+    Count keyword overlap against the listing's text fields, weighting the
+    most distinctive fields (title, style_tags, category) higher than the
+    free-text description.
+    """
+    weighted_text = " ".join(
+        [
+            listing["title"], listing["title"],          # title counts double
+            " ".join(listing["style_tags"]),
+            " ".join(listing["style_tags"]),              # tags count double
+            listing["category"],
+            listing["description"],
+            " ".join(listing["colors"]),
+            listing.get("brand") or "",
+        ]
+    ).lower()
+    haystack = set(re.findall(r"[a-z]+", weighted_text))
+
+    score = 0
+    for kw in keywords:
+        # Re-count occurrences so doubled fields actually boost the score.
+        score += len(re.findall(rf"\b{re.escape(kw)}\b", weighted_text)) if kw in haystack else 0
+    return score
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
